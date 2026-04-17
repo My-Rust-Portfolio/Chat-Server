@@ -1,86 +1,71 @@
-use crate::types::ClientList;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 
 pub struct Client {
     stream: TcpStream,
     addr: SocketAddr,
-    // Server owns the full list
-    clients: ClientList,
+    tx: broadcast::Sender<String>,
 }
 
 impl Client {
-    pub fn new(stream: TcpStream, clients: Arc<Mutex<Vec<TcpStream>>>) -> Self {
-        let addr = match stream.peer_addr() {
-            Ok(a) => a,
-            Err(e) => panic!("Could not read peer address: {}", e),
-        };
-
-        Client {
-            stream,
-            addr,
-            clients,
-        }
+    pub fn new(stream: TcpStream, addr: SocketAddr, tx: broadcast::Sender<String>) -> Self {
+        Client { stream, addr, tx }
     }
 
-    pub fn run(self) {
+    pub async fn run(self) {
         println!("[{}] Client connected", self.addr);
 
-        let reader_stream = match self.stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[{}] Failed to clone reader stream: {}", self.addr, e);
-                return;
-            }
-        };
+        let (tcp_reader, mut writer) = self.stream.into_split();
+        let mut reader = BufReader::new(tcp_reader);
+        let mut rx = self.tx.subscribe();
+        let mut line = String::new();
 
-        self.register();
+        loop {
+            tokio::select! {
+                // sent message
+                result = reader.read_line(&mut line) => {
+                    match result {
+                        Err(e) => {
+                            eprintln!("[{}] ERROR: Read error: {}", self.addr, e);
+                            break;
+                        },
+                        Ok(0) => {
+                            // read 0 bytes: client disconnect
+                            println!("[{}] Client disconnected", self.addr);
+                            break;
+                        }
+                        Ok(_) => {
+                            let message = format!("[{}]: {}", self.addr, line.trim());
+                            println!("{}", message);
+                            if let Err(e) = self.tx.send(message) {
+                                eprintln!("ERROR: Broadcast failed {}", e);
+                                break;
+                            }
 
-        let reader = BufReader::new(reader_stream);
-        for line in reader.lines() {
-            match line {
-                Ok(txt) => {
-                    println!("[{}] {txt}", self.addr);
-                    self.broadcast(&format!("[{}]: {txt}\n", self.addr));
+                            // to reuse
+                            line.clear();
+                        }
+                    }
                 }
-                Err(_) => {
-                    println!("Client Disconnected");
-                    break;
+
+                // received message
+                result = rx.recv() => {
+                    match result {
+                        Err(e) => {
+                            eprintln!("[{}] ERROR: Received error: {}", self.addr, e);
+                            break;
+                        }
+                        Ok(msg) => {
+                            if let Err(e) = writer.write_all(format!("{msg}\n").as_bytes()).await {
+                                eprintln!("[{}] ERROR: Write error: {}", self.addr, e);
+                                break;
+                            }
+                        }
+                    }
+
                 }
-            }
-        }
-    }
-
-    fn register(&self) {
-        let stream_copy = match self.stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "[{}] Failed to clone stream while registering: {}",
-                    self.addr, e
-                );
-                return;
-            }
-        };
-
-        match self.clients.lock() {
-            Ok(mut list) => list.push(stream_copy),
-            Err(e) => eprintln!(
-                "[{}] Failed to lock client list while registering: {}",
-                self.addr, e
-            ),
-        }
-    }
-
-    fn broadcast(&self, message: &str) {
-        match self.clients.lock() {
-            Err(e) => eprintln!(
-                "[{}] Failed to lock client list while broadcasting: {}",
-                self.addr, e
-            ),
-            Ok(mut list) => {
-                list.retain_mut(|client| client.write_all(message.as_bytes()).is_ok());
             }
         }
     }
